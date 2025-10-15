@@ -1,317 +1,195 @@
 #!/usr/bin/env bash
-# Script de Auditoria de Segurança - Detecção de Permissões Perigosas
-# Autor: Assistente (versão revisada)
-# Gerado em: $(date +%Y-%m-%d %T)
+# auditoria_staged_simple.sh
+# Auditoria rápida, por etapas, sem paralelismo, sem extras
+# Autor: Assistente
+# Data: $(date +%Y-%m-%d)
 
-set -o errexit
 set -o pipefail
-set -o nounset
+shopt -s nullglob
 
-# Cores para output
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# defaults
+MODE="fast"
+RUN_ALL=false
+declare -a RUN_STAGES=()
+OUTDIR="."
+DATE_TAG=$(date +%Y%m%d_%H%M%S)
 
-# Parâmetros (pode trocar/ajustar)
-TARGETS=(/ /etc /var /usr /bin /sbin /opt /home /root /tmp /var/tmp /dev/shm)
-OUTPUT_DIR="."
-OUTPUT_FILE="${OUTPUT_DIR}/auditoria_seguranca_completa_$(date +%Y%m%d_%H%M%S).txt"
+# dirs e paths
+BIN_DIRS=(/bin /sbin /usr/bin /usr/sbin /usr/local/bin /opt)
+CRIT_PATHS=(/etc /root /tmp /var)
+SEARCH_ROOTS=(/usr /opt /home)
 
-# Verifica se tem permissão de escrita no output_dir
-if ! touch "${OUTPUT_DIR}/.auditoria_test" 2>/dev/null; then
-    echo -e "${RED}Erro: sem permissão para escrever em ${OUTPUT_DIR}.${NC}"
-    exit 1
-else
-    rm -f "${OUTPUT_DIR}/.auditoria_test"
+# whitelist executáveis padrão
+read -r -d '' WHITEL <<'W' || true
+sh
+bash
+dash
+zsh
+sudo
+su
+passwd
+chmod
+chown
+cp
+mv
+rm
+ls
+find
+grep
+awk
+sed
+tar
+gzip
+gunzip
+zip
+unzip
+ssh
+scp
+curl
+wget
+systemctl
+service
+mount
+umount
+crontab
+cat
+less
+more
+man
+head
+tail
+echo
+cut
+sort
+uniq
+ip
+ss
+ping
+W
+declare -A WH; while read -r n; do [[ -n "$n" ]] && WH["$n"]=1; done <<< "$WHITEL"
+
+# helpers
+is_suid_sgid(){ local f="$1"; local perm; perm=$(stat -c "%a" "$f" 2>/dev/null || echo ""); [[ -z "$perm" ]] && return 1; perm="${perm##*(0)}"; local special=0; [[ ${#perm} -eq 4 ]] && special=${perm:0:1}; local r=""; (( special & 4 )) && r="${r}SUID"; (( special & 2 )) && r="${r}${r:+,}SGID"; [[ -n "$r" ]] && printf "%s" "$r" && return 0; return 1; }
+others_writable(){ local f="$1"; local p; p=$(stat -c "%a" "$f" 2>/dev/null || echo ""); [[ -z "$p" ]] && return 1; p="${p##*(0)}"; local o=${p: -1}; (( o & 2 )) && return 0 || return 1; }
+accessible(){ local f="$1"; [[ -e "$f" && -r "$f" ]] && return 0 || return 1; }
+
+_find_root(){ local root="$1"; shift; find "$root" -xdev "$@" -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null ; }
+
+# parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all) RUN_ALL=true; shift ;;
+    --stage) RUN_STAGES+=("$2"); shift 2 ;;
+    --deep) MODE="deep"; shift ;;
+    -h|--help) echo "Usage: $0 [--all] [--stage N] [--deep]"; exit 0 ;;
+    *) echo "Unknown: $1"; exit 1 ;;
+  esac
+done
+
+if $RUN_ALL; then RUN_STAGES=(1 2 3 4); fi
+if [[ ${#RUN_STAGES[@]} -eq 0 ]]; then
+  [[ "$MODE" == "fast" ]] && RUN_STAGES=(1 2 3 4) || RUN_STAGES=(1 2 3 4)
 fi
 
-echo -e "${BLUE}=== INICIANDO AUDITORIA DE SEGURANÇA COMPLETA ===${NC}"
-echo "Analisando sistema em busca de permissões perigosas..."
-echo "Arquivo de saída: $OUTPUT_FILE"
-echo
+# -------------------
+# STAGES
+# -------------------
 
-# Função para classificar risco baseada em permissão octal (ex: 0755, 1777, 4755)
-classificar_risco() {
-    local permissao="$1"   # string como "755" ou "4755"
-    local caminho="$2"
-    local tipo="$3"        # "arquivo" ou "diretorio"
+stage1_suids(){
+  FILE="${OUTDIR}/stage1_suids_${DATE_TAG}.txt"
+  echo "=== STAGE 1: SUID/SGID ===" > "$FILE"
+  printf "%-6s | %-8s | %s\n" "PERM" "FLAGS" "CAMINHO" >> "$FILE"
+  echo "----------------------------------------" >> "$FILE"
 
-    # Normalizar: remover zeros à esquerda se existirem
-    permissao="${permissao##*(0)}"
+  dirs=("${BIN_DIRS[@]}")
+  [[ "$MODE" == "deep" ]] && dirs+=("/usr" "/opt")
 
-    # Se for 3 dígitos (ex: 755), pad com 0 à esquerda para facilitar
-    if [[ ${#permissao} -eq 3 ]]; then
-        special=0
-        perms="$permissao"
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    depth=3; [[ "$MODE" == "fast" ]] && depth=3
+    _find_root "$d" -maxdepth "$depth" -type f \( -perm -4000 -o -perm -2000 \) | while read -r f; do
+      perm=$(stat -c "%a" "$f" 2>/dev/null || echo "??")
+      flags=$(is_suid_sgid "$f")
+      printf "%-6s | %-8s | %s\n" "$perm" "$flags" "$f" >> "$FILE"
+    done
+  done
+  echo "[+] Stage 1 concluído: $FILE"
+}
+
+stage2_world_writable(){
+  FILE="${OUTDIR}/stage2_world_writable_${DATE_TAG}.txt"
+  echo "=== STAGE 2: WORLD-WRITABLE ===" > "$FILE"
+  printf "%-6s | %s\n" "PERM" "CAMINHO" >> "$FILE"
+  echo "----------------------------------------" >> "$FILE"
+
+  for p in "${CRIT_PATHS[@]}"; do
+    [[ -d "$p" ]] || continue
+    depth=2; [[ "$MODE" == "deep" ]] && depth=4
+    _find_root "$p" -maxdepth "$depth" | while read -r f; do
+      if others_writable "$f"; then
+        perm=$(stat -c "%a" "$f" 2>/dev/null || echo "??")
+        printf "%-6s | %s\n" "$perm" "$f" >> "$FILE"
+      fi
+    done
+  done
+  echo "[+] Stage 2 concluído: $FILE"
+}
+
+stage3_configs(){
+  FILE="${OUTDIR}/stage3_configs_${DATE_TAG}.txt"
+  echo "=== STAGE 3: CONFIGS SENSÍVEIS ===" > "$FILE"
+  printf "%-8s | %-6s | %s\n" "TAG" "PERM" "CAMINHO" >> "$FILE"
+  echo "----------------------------------------" >> "$FILE"
+
+  sens=(/etc/passwd /etc/shadow /etc/gshadow /etc/group /etc/sudoers /root/.ssh/id_rsa)
+  for s in "${sens[@]}"; do
+    if [[ -e "$s" ]]; then
+      perm=$(stat -c "%a" "$s" 2>/dev/null || echo "??")
+      echo "CRITICAL | $perm | $s" >> "$FILE"
     else
-        special="${permissao:0:1}"
-        perms="${permissao:1:3}"
+      echo "MISSING  | --  | $s" >> "$FILE"
     fi
-
-    # obter dígito "others"
-    others=$((10#${perms:2:1}))
-
-    # verifica write para outros (bit 2)
-    if (( others & 2 )); then
-        # Se arquivo em paths sensíveis -> crítico
-        if [[ "$caminho" =~ ^(/etc/|/bin/|/sbin/|/usr/bin/|/usr/sbin/|/root/) ]]; then
-            echo "CRÍTICO"
-            return
-        else
-            if [[ "$tipo" == "diretorio" ]]; then
-                echo "MUITO ALTO"
-                return
-            else
-                echo "ALTO"
-                return
-            fi
-        fi
-    fi
-
-    # 777 total (todos com rwx)
-    if [[ "${perms}" == "777" ]]; then
-        echo "CRÍTICO"
-        return
-    fi
-
-    # SUID (bit 4 no special)
-    if (( special & 4 )); then
-        if [[ "$caminho" =~ ^(/bin/|/sbin/|/usr/bin/|/usr/sbin/) && "$tipo" == "arquivo" ]]; then
-            echo "ALTO"
-            return
-        else
-            echo "MÉDIO"
-            return
-        fi
-    fi
-
-    # SGID (bit 2 no special) e sticky (bit 1)
-    if (( special & 2 )); then
-        if [[ "$tipo" == "diretorio" ]]; then
-            echo "ALTO"
-            return
-        else
-            echo "MÉDIO"
-            return
-        fi
-    fi
-
-    # Sticky bit em diretórios (ex: /tmp costuma ter sticky)
-    if (( special & 1 )) && [[ "$tipo" == "diretorio" ]]; then
-        echo "BAIXO"
-        return
-    fi
-
-    echo "BAIXO"
+  done
+  echo "[+] Stage 3 concluído: $FILE"
 }
 
-# Função para descrever binário (apenas exemplos)
-descrever_binario() {
-    local binario="$1"
-    local tipo="$2"
-    case "$(basename "$binario")" in
-        passwd) echo "Utilitário para alterar senhas de usuário" ;;
-        su) echo "Comando para trocar de usuário" ;;
-        sudo) echo "Executar comandos como outro usuário" ;;
-        chmod) echo "Alterar permissões de arquivos" ;;
-        chown) echo "Alterar proprietário de arquivos" ;;
-        mount) echo "Montar sistemas de arquivos" ;;
-        ssh|scp) echo "Cliente SSH" ;;
-        crontab) echo "Agendador de tarefas" ;;
-        *) 
-            if [[ "$tipo" == "diretorio" ]]; then
-                echo "Diretório do sistema"
-            else
-                echo "Binário/Arquivo do sistema"
-            fi
-            ;;
-    esac
-}
+stage4_incomuns(){
+  FILE="${OUTDIR}/stage4_incomuns_${DATE_TAG}.txt"
+  echo "=== STAGE 4: EXECUTÁVEIS INCOMUNS ===" > "$FILE"
+  printf "%-8s | %-6s | %s\n" "TAG" "PERM" "CAMINHO" >> "$FILE"
+  echo "----------------------------------------" >> "$FILE"
 
-declare -a resultados=()
+  search_dirs=("${BIN_DIRS[@]}")
+  [[ "$MODE" == "deep" ]] && search_dirs+=("/usr" "/opt" "/usr/local/bin" "/home")
 
-echo -e "${YELLOW}Procurando arquivos e diretórios perigosos...${NC}"
-
-# 1) Arquivos com SUID/SGID (find já filtra)
-while IFS= read -r -d '' arquivo; do
-    # proteção extra: pular links simbólicos
-    [[ -L "$arquivo" ]] && continue
-    permissao=$(stat -c "%a" "$arquivo" 2>/dev/null || echo "")
-    [[ -z "$permissao" ]] && continue
-    risco=$(classificar_risco "$permissao" "$arquivo" "arquivo")
-    descricao=$(descrever_binario "$arquivo" "arquivo")
-    resultados+=("$risco|SUID/SGID|$arquivo|$permissao|$descricao")
-done < <(find "${TARGETS[@]}" -xdev -type f \( -perm -4000 -o -perm -2000 \) -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" -print0 2>/dev/null || true)
-
-# 2) Diretórios com write para others (inclui 777)
-while IFS= read -r -d '' diretorio; do
-    [[ -L "$diretorio" ]] && continue
-    permissao=$(stat -c "%a" "$diretorio" 2>/dev/null || echo "")
-    [[ -z "$permissao" ]] && continue
-    # check others write
-    perms="${permissao##*(0)}"
-    # pad
-    if [[ ${#perms} -eq 3 ]]; then others_dig="${perms:2:1}"; else others_dig="${perms:2:1}"; fi
-    if (( 10#$others_dig & 2 )); then
-        risco=$(classificar_risco "$permissao" "$diretorio" "diretorio")
-        descricao=$(descrever_binario "$diretorio" "diretorio")
-        resultados+=("$risco|DIRETÓRIO W|$diretorio|$permissao|$descricao - Write para outros usuários")
-    fi
-done < <(find "${TARGETS[@]}" -xdev -type d -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" -print0 2>/dev/null || true)
-
-# 3) Arquivos em locais sensíveis com write para others
-sensitive_paths=(/etc /var /usr /bin /sbin /opt /home /root)
-while IFS= read -r -d '' arquivo; do
-    [[ -L "$arquivo" ]] && continue
-    permissao=$(stat -c "%a" "$arquivo" 2>/dev/null || echo "")
-    [[ -z "$permissao" ]] && continue
-    perms="${permissao##*(0)}"
-    if [[ ${#perms} -ge 3 ]]; then others_dig="${perms:2:1}"; else others_dig="0"; fi
-    if (( 10#$others_dig & 2 )); then
-        risco=$(classificar_risco "$permissao" "$arquivo" "arquivo")
-        descricao=$(descrever_binario "$arquivo" "arquivo")
-        resultados+=("$risco|ARQUIVO W|$arquivo|$permissao|$descricao - Write para outros usuários")
-    fi
-done < <(find "${sensitive_paths[@]}" -xdev -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" -print0 2>/dev/null || true)
-
-# 4) Configurações sensíveis (lista)
-config_sensiveis=(
-    "/etc/passwd"
-    "/etc/shadow"
-    "/etc/gshadow"
-    "/etc/group"
-    "/etc/sudoers"
-    "/etc/ssh/sshd_config"
-    "/root/.bashrc"
-    "/root/.ssh/authorized_keys"
-    "/root/.ssh/id_rsa"
-    "/etc/crontab"
-)
-for config in "${config_sensiveis[@]}"; do
-    for expanded in $config; do
-        [[ -e "$expanded" ]] || continue
-        permissao=$(stat -c "%a" "$expanded" 2>/dev/null || echo "")
-        [[ -z "$permissao" ]] && continue
-        perms="${permissao##*(0)}"
-        if [[ ${#perms} -ge 3 ]]; then others_dig="${perms:2:1}"; else others_dig="0"; fi
-        if (( 10#$others_dig & 2 )) || [[ "$permissao" == "777" ]]; then
-            risco="CRÍTICO"
-            descricao="Arquivo de configuração sensível"
-            resultados+=("$risco|CONFIGURAÇÃO|$expanded|$permissao|$descricao com permissões perigosas")
-        fi
+  for bd in "${search_dirs[@]}"; do
+    [[ -d "$bd" ]] || continue
+    depth=2; [[ "$MODE" == "deep" ]] && depth=3
+    _find_root "$bd" -maxdepth "$depth" -type f | while read -r f; do
+      [[ -x "$f" ]] || continue
+      name=$(basename "$f")
+      base="${name%.*}"
+      [[ -n "${WH[$name]:-}" || -n "${WH[$base]:-}" ]] && continue
+      perm=$(stat -c "%a" "$f" 2>/dev/null || echo "??")
+      flags=$(is_suid_sgid "$f")
+      tag="INCOMUM"; [[ -n "$flags" ]] && tag="INCOMUM-SUID"
+      printf "%-8s | %-6s | %s\n" "$tag" "$perm" "$f" >> "$FILE"
     done
-done
-
-# 5) Executáveis em /tmp etc.
-dirs_tmp=(/tmp /var/tmp /dev/shm)
-for tmp_dir in "${dirs_tmp[@]}"; do
-    [[ -d "$tmp_dir" ]] || continue
-    while IFS= read -r -d '' arquivo; do
-        [[ -L "$arquivo" ]] && continue
-        [[ -f "$arquivo" && -x "$arquivo" ]] || continue
-        permissao=$(stat -c "%a" "$arquivo" 2>/dev/null || echo "")
-        risco=$(classificar_risco "$permissao" "$arquivo" "arquivo")
-        descricao="Script/binário em diretório temporário"
-        resultados+=("$risco|TMP EXECUTÁVEL|$arquivo|$permissao|$descricao")
-    done < <(find "$tmp_dir" -xdev -type f -executable -not -path "*/.*" -print0 2>/dev/null || true)
-done
-
-# 6) Arquivos ocultos em home dirs
-while IFS= read -r -d '' home_dir; do
-    [[ -d "$home_dir" ]] || continue
-    while IFS= read -r -d '' hidden_file; do
-        [[ -f "$hidden_file" ]] || continue
-        permissao=$(stat -c "%a" "$hidden_file" 2>/dev/null || echo "")
-        if [[ -x "$hidden_file" ]] || { perms="${permissao##*(0)}"; others_dig="${perms:2:1}"; (( 10#$others_dig & 2 )); }; then
-            risco=$(classificar_risco "$permissao" "$hidden_file" "arquivo")
-            descricao="Arquivo oculto com permissões perigosas"
-            resultados+=("$risco|ARQUIVO OCULTO|$hidden_file|$permissao|$descricao")
-        fi
-    done < <(find "$home_dir" -maxdepth 1 -name ".*" -type f -print0 2>/dev/null || true)
-done < <(find /home /root -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null || true)
-
-# Ordenar resultados por risco simples (peso)
-obter_peso_risco() {
-    case "$1" in
-        "CRÍTICO") echo 1 ;;
-        "MUITO ALTO") echo 2 ;;
-        "ALTO") echo 3 ;;
-        "MÉDIO") echo 4 ;;
-        "BAIXO") echo 5 ;;
-        *) echo 6 ;;
-    esac
+  done
+  echo "[+] Stage 4 concluído: $FILE"
 }
 
-# Bubble sort (suficiente para arrays de tamanho moderado)
-for ((i=0; i<${#resultados[@]}; i++)); do
-    for ((j=i+1; j<${#resultados[@]}; j++)); do
-        ri=$(obter_peso_risco "${resultados[i]%%|*}")
-        rj=$(obter_peso_risco "${resultados[j]%%|*}")
-        if (( ri > rj )); then
-            tmp="${resultados[i]}"; resultados[i]="${resultados[j]}"; resultados[j]="$tmp"
-        fi
-    done
+# -------------------
+# RUNNER
+# -------------------
+for s in "${RUN_STAGES[@]}"; do
+  case "$s" in
+    1) stage1_suids ;;
+    2) stage2_world_writable ;;
+    3) stage3_configs ;;
+    4) stage4_incomuns ;;
+    *) echo "Unknown stage $s" ;;
+  esac
 done
 
-# Gerar relatório
-{
-    echo "===================================================================="
-    echo "RELATÓRIO DE AUDITORIA DE SEGURANÇA COMPLETA"
-    echo "Data: $(date)"
-    echo "Sistema: $(uname -a)"
-    echo "===================================================================="
-    echo
-    echo "RESUMO:"
-    echo "Total de itens encontrados: ${#resultados[@]}"
-    echo
-    echo "DETALHES:"
-    echo
-    printf "%-12s | %-18s | %-70s | %-8s | %s\n" "RISCO" "TIPO" "CAMINHO" "PERM" "DESCRIÇÃO"
-    echo "------------|--------------------|-----------------------------------------------------------------------|----------|----------------"
-} > "$OUTPUT_FILE"
-
-for resultado in "${resultados[@]}"; do
-    IFS='|' read -r risco tipo caminho permissao descricao <<< "$resultado"
-    case "$risco" in
-        "CRÍTICO") cor=$RED ;;
-        "MUITO ALTO") cor=$RED ;;
-        "ALTO") cor=$YELLOW ;;
-        "MÉDIO") cor=$GREEN ;;
-        *) cor=$CYAN ;;
-    esac
-
-    # Mostrar apenas os níveis mais críticos no terminal
-    if [[ "$risco" == "CRÍTICO" || "$risco" == "MUITO ALTO" || "$risco" == "ALTO" ]]; then
-        printf "${cor}%-12s${NC} | %-18s | %-70s | %-8s | %s\n" "$risco" "$tipo" "$(echo "$caminho" | cut -c1-70)" "$permissao" "$descricao"
-    fi
-
-    printf "%-12s | %-18s | %-70s | %-8s | %s\n" "$risco" "$tipo" "$caminho" "$permissao" "$descricao" >> "$OUTPUT_FILE"
-done
-
-# Rodapé resumido (padrões e recomendações)
-{
-    echo
-    echo "===================================================================="
-    echo "RECOMENDAÇÕES DE SEGURANÇA (RESUMO)"
-    echo " - Remova escrita para 'others' quando não for necessária: chmod o-w <arquivo|dir>"
-    echo " - Diretórios públicos: use sticky bit: chmod +t <dir> (ex: /tmp)"
-    echo " - Remova SUID/SGID se não for essencial: chmod u-s <arquivo> ; chmod g-s <arquivo>"
-    echo " - Arquivos sensíveis: chmod 600 <arquivo>"
-    echo " - Evite executáveis em /tmp e similares; considere noexec,nosuid em fstab"
-    echo
-    echo "Comandos úteis:"
-    echo "   chmod o-w <arquivo>"
-    echo "   chmod 755 <diretório>"
-    echo "   chmod 644 <arquivo>"
-    echo "   chmod u-s <arquivo>"
-    echo "   chmod g-s <arquivo>"
-    echo "   chown root:root <arquivo>"
-    echo "===================================================================="
-} >> "$OUTPUT_FILE"
-
-echo -e "${GREEN}AUDITORIA CONCLUÍDA! Relatório salvo em: ${OUTPUT_FILE}${NC}"
-echo -e "${GREEN}Total de itens identificados: ${#resultados[@]}${NC}"
+echo "[+] Auditoria concluída. Arquivos gerados por etapa em $OUTDIR"
